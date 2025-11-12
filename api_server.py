@@ -3,8 +3,11 @@ import time
 import random
 import uuid
 import logging
-from typing import Optional, Literal
+import threading
+from typing import Optional, Literal, Dict, Any
 from pathlib import Path
+from contextlib import asynccontextmanager
+from enum import Enum
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
@@ -25,10 +28,52 @@ logger = logging.getLogger(__name__)
 # Global predictor instances
 predictors = {}
 
+# Job tracking
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+jobs: Dict[str, Dict[str, Any]] = {}
+jobs_lock = threading.Lock()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize predictors on startup and cleanup on shutdown."""
+    gpu_num = int(os.getenv("GPU_NUM", "1"))
+    use_quant = os.getenv("USE_QUANT", "true").lower() == "true"
+    use_offload = os.getenv("USE_OFFLOAD", "true").lower() == "true"
+    high_cpu_memory = os.getenv("HIGH_CPU_MEMORY", "true").lower() == "true"
+    parameters_level = os.getenv("PARAMETERS_LEVEL", "true").lower() == "true"
+    
+    # Initialize T2V by default
+    task_types = os.getenv("TASK_TYPES", "t2v").split(",")
+    
+    for task_type in task_types:
+        task_type = task_type.strip()
+        try:
+            predictors[task_type] = initialize_predictor(
+                task_type=task_type,
+                gpu_num=gpu_num,
+                use_quant=use_quant,
+                use_offload=use_offload,
+                high_cpu_memory=high_cpu_memory,
+                parameters_level=parameters_level
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize {task_type} predictor: {e}")
+    
+    yield
+    
+    # Cleanup on shutdown
+    logger.info("Shutting down...")
+
 app = FastAPI(
     title="SkyReels Video Generation API",
     description="FastAPI server for SkyReels AI video generation (T2V and I2V)",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 # Configuration
@@ -56,9 +101,15 @@ class VideoGenerationRequest(BaseModel):
 class VideoGenerationResponse(BaseModel):
     job_id: str
     status: str
+    message: Optional[str] = None
+
+class JobStatusResponse(BaseModel):
+    job_id: str
+    status: str
     video_path: Optional[str] = None
     message: Optional[str] = None
     generation_time: Optional[float] = None
+    progress: Optional[str] = None
 
 def get_model_id(task_type: str) -> str:
     """Get the appropriate model ID based on task type."""
@@ -87,31 +138,39 @@ def initialize_predictor(task_type: str, gpu_num: int = 1, use_quant: bool = Tru
     logger.info(f"Predictor initialized for {task_type}")
     return predictor
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize predictors on startup."""
-    gpu_num = int(os.getenv("GPU_NUM", "1"))
-    use_quant = os.getenv("USE_QUANT", "true").lower() == "true"
-    use_offload = os.getenv("USE_OFFLOAD", "true").lower() == "true"
-    high_cpu_memory = os.getenv("HIGH_CPU_MEMORY", "true").lower() == "true"
-    parameters_level = os.getenv("PARAMETERS_LEVEL", "true").lower() == "true"
-    
-    # Initialize T2V by default
-    task_types = os.getenv("TASK_TYPES", "t2v").split(",")
-    
-    for task_type in task_types:
-        task_type = task_type.strip()
-        try:
-            predictors[task_type] = initialize_predictor(
-                task_type=task_type,
-                gpu_num=gpu_num,
-                use_quant=use_quant,
-                use_offload=use_offload,
-                high_cpu_memory=high_cpu_memory,
-                parameters_level=parameters_level
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize {task_type} predictor: {e}")
+def process_video_generation(job_id: str, task_type: str, kwargs: dict, fps: int):
+    """Background thread function to process video generation."""
+    try:
+        with jobs_lock:
+            jobs[job_id]["status"] = JobStatus.PROCESSING
+            jobs[job_id]["progress"] = "Generating video..."
+        
+        logger.info(f"Starting video generation for job {job_id}")
+        start_time = time.time()
+        
+        predictor = predictors[task_type]
+        output = predictor.inference(kwargs)
+        
+        # Save video
+        output_path = OUTPUT_DIR / f"{job_id}.mp4"
+        export_to_video(output, str(output_path), fps=fps)
+        
+        generation_time = time.time() - start_time
+        
+        with jobs_lock:
+            jobs[job_id]["status"] = JobStatus.COMPLETED
+            jobs[job_id]["video_path"] = f"/video/{job_id}"
+            jobs[job_id]["generation_time"] = generation_time
+            jobs[job_id]["progress"] = "Completed"
+        
+        logger.info(f"Video generated successfully for job {job_id} in {generation_time:.2f}s")
+        
+    except Exception as e:
+        logger.error(f"Error generating video for job {job_id}: {str(e)}")
+        with jobs_lock:
+            jobs[job_id]["status"] = JobStatus.FAILED
+            jobs[job_id]["message"] = str(e)
+            jobs[job_id]["progress"] = "Failed"
 
 @app.get("/")
 async def root():
@@ -138,7 +197,7 @@ async def health_check():
 
 @app.post("/generate", response_model=VideoGenerationResponse)
 async def generate_video(request: VideoGenerationRequest):
-    """Generate video from text or image+text."""
+    """Generate video from text or image+text (async - returns immediately)."""
     job_id = str(uuid.uuid4())
     
     try:
@@ -185,32 +244,55 @@ async def generate_video(request: VideoGenerationRequest):
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid image data: {str(e)}")
         
-        # Generate video
-        logger.info(f"Starting video generation for job {job_id}")
-        start_time = time.time()
+        # Initialize job
+        with jobs_lock:
+            jobs[job_id] = {
+                "status": JobStatus.PENDING,
+                "task_type": request.task_type,
+                "prompt": request.prompt,
+                "created_at": time.time(),
+                "progress": "Queued"
+            }
         
-        predictor = predictors[request.task_type]
-        output = predictor.inference(kwargs)
+        # Start background thread
+        thread = threading.Thread(
+            target=process_video_generation,
+            args=(job_id, request.task_type, kwargs, request.fps),
+            daemon=True
+        )
+        thread.start()
         
-        # Save video
-        output_path = OUTPUT_DIR / f"{job_id}.mp4"
-        export_to_video(output, str(output_path), fps=request.fps)
-        
-        generation_time = time.time() - start_time
-        logger.info(f"Video generated successfully for job {job_id} in {generation_time:.2f}s")
+        logger.info(f"Job {job_id} queued for processing")
         
         return VideoGenerationResponse(
             job_id=job_id,
-            status="completed",
-            video_path=f"/video/{job_id}",
-            generation_time=generation_time
+            status=JobStatus.PENDING,
+            message="Job queued for processing. Use /status/{job_id} to check progress."
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error generating video for job {job_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Video generation failed: {str(e)}")
+        logger.error(f"Error queueing job {job_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
+
+@app.get("/status/{job_id}", response_model=JobStatusResponse)
+async def get_job_status(job_id: str):
+    """Get the status of a video generation job."""
+    with jobs_lock:
+        if job_id not in jobs:
+            raise HTTPException(status_code=404, detail="Job not found")
+        
+        job = jobs[job_id].copy()
+    
+    return JobStatusResponse(
+        job_id=job_id,
+        status=job["status"],
+        video_path=job.get("video_path"),
+        message=job.get("message"),
+        generation_time=job.get("generation_time"),
+        progress=job.get("progress")
+    )
 
 @app.get("/video/{job_id}")
 async def get_video(job_id: str):
@@ -242,7 +324,7 @@ async def generate_video_multipart(
     negative_prompt: str = Form("Aerial view, aerial view, overexposed, low quality, deformation, a poor composition, bad hands, bad teeth, bad eyes, bad limbs, distortion"),
     cfg_for: bool = Form(False)
 ):
-    """Generate video using multipart form data (alternative endpoint for file uploads)."""
+    """Generate video using multipart form data (async - returns immediately)."""
     job_id = str(uuid.uuid4())
     
     try:
@@ -288,32 +370,37 @@ async def generate_video_multipart(
             except Exception as e:
                 raise HTTPException(status_code=400, detail=f"Invalid image file: {str(e)}")
         
-        # Generate video
-        logger.info(f"Starting video generation for job {job_id}")
-        start_time = time.time()
+        # Initialize job
+        with jobs_lock:
+            jobs[job_id] = {
+                "status": JobStatus.PENDING,
+                "task_type": task_type,
+                "prompt": prompt,
+                "created_at": time.time(),
+                "progress": "Queued"
+            }
         
-        predictor = predictors[task_type]
-        output = predictor.inference(kwargs)
+        # Start background thread
+        thread = threading.Thread(
+            target=process_video_generation,
+            args=(job_id, task_type, kwargs, fps),
+            daemon=True
+        )
+        thread.start()
         
-        # Save video
-        output_path = OUTPUT_DIR / f"{job_id}.mp4"
-        export_to_video(output, str(output_path), fps=fps)
-        
-        generation_time = time.time() - start_time
-        logger.info(f"Video generated successfully for job {job_id} in {generation_time:.2f}s")
+        logger.info(f"Job {job_id} queued for processing")
         
         return {
             "job_id": job_id,
-            "status": "completed",
-            "video_path": f"/video/{job_id}",
-            "generation_time": generation_time
+            "status": JobStatus.PENDING,
+            "message": "Job queued for processing. Use /status/{job_id} to check progress."
         }
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error generating video for job {job_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Video generation failed: {str(e)}")
+        logger.error(f"Error queueing job {job_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to queue job: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
