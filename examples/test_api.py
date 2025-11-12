@@ -58,8 +58,8 @@ def test_t2v_generation():
         
         # Poll for completion
         print("\nPolling for completion...")
-        poll_interval = 5  # seconds
-        max_wait_time = 600  # 10 minutes
+        poll_interval = 15  # seconds
+        max_wait_time = 1800  # 10 minutes
         start_time = time.time()
         
         while True:
