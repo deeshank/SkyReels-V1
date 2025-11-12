@@ -4,6 +4,7 @@ import random
 import uuid
 import logging
 import threading
+import queue
 from typing import Optional, Literal, Dict, Any
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -37,10 +38,14 @@ class JobStatus(str, Enum):
 
 jobs: Dict[str, Dict[str, Any]] = {}
 jobs_lock = threading.Lock()
+generation_queue = None  # Will be initialized in lifespan
+worker_thread = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize predictors on startup and cleanup on shutdown."""
+    global generation_queue, worker_thread
+    
     gpu_num = int(os.getenv("GPU_NUM", "1"))
     use_quant = os.getenv("USE_QUANT", "true").lower() == "true"
     use_offload = os.getenv("USE_OFFLOAD", "true").lower() == "true"
@@ -64,10 +69,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Failed to initialize {task_type} predictor: {e}")
     
+    # Initialize job queue and worker thread
+    generation_queue = queue.Queue()
+    worker_thread = threading.Thread(target=process_video_generation_worker, daemon=True)
+    worker_thread.start()
+    logger.info("Started video generation worker thread")
+    
     yield
     
     # Cleanup on shutdown
     logger.info("Shutting down...")
+    if generation_queue:
+        generation_queue.put(None)  # Signal worker to stop
+    if worker_thread:
+        worker_thread.join(timeout=5)
 
 app = FastAPI(
     title="SkyReels Video Generation API",
@@ -138,39 +153,59 @@ def initialize_predictor(task_type: str, gpu_num: int = 1, use_quant: bool = Tru
     logger.info(f"Predictor initialized for {task_type}")
     return predictor
 
-def process_video_generation(job_id: str, task_type: str, kwargs: dict, fps: int):
-    """Background thread function to process video generation."""
-    try:
-        with jobs_lock:
-            jobs[job_id]["status"] = JobStatus.PROCESSING
-            jobs[job_id]["progress"] = "Generating video..."
-        
-        logger.info(f"Starting video generation for job {job_id}")
-        start_time = time.time()
-        
-        predictor = predictors[task_type]
-        output = predictor.inference(kwargs)
-        
-        # Save video
-        output_path = OUTPUT_DIR / f"{job_id}.mp4"
-        export_to_video(output, str(output_path), fps=fps)
-        
-        generation_time = time.time() - start_time
-        
-        with jobs_lock:
-            jobs[job_id]["status"] = JobStatus.COMPLETED
-            jobs[job_id]["video_path"] = f"/video/{job_id}"
-            jobs[job_id]["generation_time"] = generation_time
-            jobs[job_id]["progress"] = "Completed"
-        
-        logger.info(f"Video generated successfully for job {job_id} in {generation_time:.2f}s")
-        
-    except Exception as e:
-        logger.error(f"Error generating video for job {job_id}: {str(e)}")
-        with jobs_lock:
-            jobs[job_id]["status"] = JobStatus.FAILED
-            jobs[job_id]["message"] = str(e)
-            jobs[job_id]["progress"] = "Failed"
+def process_video_generation_worker():
+    """Background worker thread that processes video generation jobs from queue."""
+    while True:
+        try:
+            # Get job from queue (blocking)
+            job_data = generation_queue.get()
+            
+            if job_data is None:  # Shutdown signal
+                break
+            
+            job_id = job_data["job_id"]
+            task_type = job_data["task_type"]
+            kwargs = job_data["kwargs"]
+            fps = job_data["fps"]
+            
+            try:
+                with jobs_lock:
+                    jobs[job_id]["status"] = JobStatus.PROCESSING
+                    jobs[job_id]["progress"] = "Generating video..."
+                
+                logger.info(f"Starting video generation for job {job_id}")
+                start_time = time.time()
+                
+                predictor = predictors[task_type]
+                output = predictor.inference(kwargs)
+                
+                # Save video
+                output_path = OUTPUT_DIR / f"{job_id}.mp4"
+                export_to_video(output, str(output_path), fps=fps)
+                
+                generation_time = time.time() - start_time
+                
+                with jobs_lock:
+                    jobs[job_id]["status"] = JobStatus.COMPLETED
+                    jobs[job_id]["video_path"] = f"/video/{job_id}"
+                    jobs[job_id]["generation_time"] = generation_time
+                    jobs[job_id]["progress"] = "Completed"
+                
+                logger.info(f"Video generated successfully for job {job_id} in {generation_time:.2f}s")
+                
+            except Exception as e:
+                logger.error(f"Error generating video for job {job_id}: {str(e)}")
+                with jobs_lock:
+                    jobs[job_id]["status"] = JobStatus.FAILED
+                    jobs[job_id]["message"] = str(e)
+                    jobs[job_id]["progress"] = "Failed"
+            
+            finally:
+                generation_queue.task_done()
+                
+        except Exception as e:
+            logger.error(f"Worker thread error: {e}")
+            time.sleep(1)
 
 @app.get("/")
 async def root():
@@ -254,13 +289,13 @@ async def generate_video(request: VideoGenerationRequest):
                 "progress": "Queued"
             }
         
-        # Start background thread
-        thread = threading.Thread(
-            target=process_video_generation,
-            args=(job_id, request.task_type, kwargs, request.fps),
-            daemon=True
-        )
-        thread.start()
+        # Add job to queue (worker thread will process it)
+        generation_queue.put({
+            "job_id": job_id,
+            "task_type": request.task_type,
+            "kwargs": kwargs,
+            "fps": request.fps
+        })
         
         logger.info(f"Job {job_id} queued for processing")
         
@@ -380,13 +415,13 @@ async def generate_video_multipart(
                 "progress": "Queued"
             }
         
-        # Start background thread
-        thread = threading.Thread(
-            target=process_video_generation,
-            args=(job_id, task_type, kwargs, fps),
-            daemon=True
-        )
-        thread.start()
+        # Add job to queue (worker thread will process it)
+        generation_queue.put({
+            "job_id": job_id,
+            "task_type": task_type,
+            "kwargs": kwargs,
+            "fps": fps
+        })
         
         logger.info(f"Job {job_id} queued for processing")
         
